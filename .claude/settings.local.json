@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xcodebuild *)",
+      "Bash(./build_dmg.sh)",
+      "Bash(security find-identity *)",
+      "Bash(lipo -info \"Export/Alpha的文件同步工具.app/Contents/MacOS/Alpha的文件同步工具\")",
+      "Bash(/usr/libexec/PlistBuddy -c \"Print LSMinimumSystemVersion\" -c \"Print CFBundleShortVersionString\" -c \"Print CFBundleVersion\" \"Export/Alpha的文件同步工具.app/Contents/Info.plist\")",
+      "Bash(/usr/libexec/PlistBuddy -c \"Print CFBundleLocalizations\" \"Export/Alpha的文件同步工具.app/Contents/Info.plist\")",
+      "Bash(hdiutil verify *)",
+      "Bash(/usr/libexec/PlistBuddy *)",
+      "Bash(grep -E \"==>|error:|BUILD|Architectures|created:.*\\\\.dmg$|文件大小\")",
+      "Bash(grep -E \"==>|error:|BUILD SUCCEEDED|Architectures|created:.*\\\\.dmg$|文件大小\")",
+      "Bash(lipo -info \"build/Export/Alpha的文件同步工具.app/Contents/MacOS/Alpha的文件同步工具\")",
+      "Bash(/usr/libexec/PlistBuddy -c \"Print :CFBundleShortVersionString\" \"build/Export/Alpha的文件同步工具.app/Contents/Info.plist\")",
+      "Bash(defaults read *)"
+    ]
+  }
+}
