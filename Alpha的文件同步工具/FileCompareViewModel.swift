@@ -30,26 +30,33 @@ final class FileCompareViewModel: ObservableObject {
         let strictMD5: Bool
     }
 
-    @Published var sourcePath = ""
-    @Published var destinationPath = ""
-    @Published var includeHiddenItems = false
+    @Published var sourcePath = "" {
+        didSet { invalidateComparison(message: "路径已更新，请重新对比。") }
+    }
+    @Published var destinationPath = "" {
+        didSet { invalidateComparison(message: "路径已更新，请重新对比。") }
+    }
+    @Published var includeHiddenItems = false {
+        didSet { invalidateComparison(message: "“包含隐藏文件”已更改，请重新对比。") }
+    }
     /// 严格 MD5 校验：关闭（默认）时，「大小+修改时间一致」即判相同、跳过内容读盘，重扫极快；
     /// 开启时对所有大小相同的文件两端全量 MD5，最稳但慢。对比与同步共用同一设置，保证两者判定一致。
     @Published var strictMD5 = UserDefaults.standard.object(forKey: "strictMD5") as? Bool ?? false {
-        didSet { UserDefaults.standard.set(strictMD5, forKey: "strictMD5") }
+        didSet {
+            UserDefaults.standard.set(strictMD5, forKey: "strictMD5")
+            invalidateComparison(message: "“严格 MD5 校验”已更改，请重新对比。")
+        }
     }
     /// 开启后：同步时把源目录以其自身文件夹名放入目标目录（如 A→B 得到 B/<A名>/…），而非直接铺到目标根。
     /// 独立“对比”按 A→B 方向预览（对比 A 根 vs B/<A名>）。
     @Published var includeRootDirectory = false {
-        didSet {
-            // 对比基准变了，旧结果作废。
-            items = []
-            mergeSummary = nil
-            errorMessage = nil
-            statusMessage = "“包含本目录”已\(includeRootDirectory ? "开启" : "关闭")，请重新对比。"
-        }
+        didSet { invalidateComparison(message: "“包含本目录”已\(includeRootDirectory ? "开启" : "关闭")，请重新对比。") }
     }
     @Published var items: [FileComparisonItem] = []
+    /// 完整对比结果（含 .same）。界面表格只展示差异项，但统计必须基于完整集合。
+    private var comparedItems: [FileComparisonItem] = []
+    /// 缓存的统计值：避免每次进度刷新触发 SwiftUI body 时都对数十万项做 O(n) 扫描。
+    @Published private(set) var statistics = CompareStatistics(items: [])
     @Published var isWorking = false
     @Published var statusMessage = "请选择路径 A 和路径 B，然后点击“开始对比”。"
     @Published var errorMessage: String?
@@ -89,7 +96,9 @@ final class FileCompareViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.cleanupForTermination()
+            Task { @MainActor [weak self] in
+                self?.cleanupForTermination()
+            }
         }
     }
 
@@ -99,12 +108,10 @@ final class FileCompareViewModel: ObservableObject {
         }
     }
 
-    var statistics: CompareStatistics {
-        CompareStatistics(items: items)
-    }
-
     var mergeableItemCount: Int {
-        items.filter(\.canMergeLeftToRight).count
+        items.reduce(0) { count, item in
+            count + (item.canMergeLeftToRight ? 1 : 0)
+        }
     }
 
     var canCompare: Bool {
@@ -120,9 +127,19 @@ final class FileCompareViewModel: ObservableObject {
         cancelCurrentWork?()
     }
 
-    /// 是否可重试失败项：有失败项、不在操作中、且存在上次同步配置快照。
+    /// 是否可重试失败项：有失败项、不在操作中，且上次同步配置与当前界面状态完全一致。
+    /// 路径或选项被修改过时必须重新对比，避免“重试”在用户看不到的旧目录上执行覆盖。
     var canRetry: Bool {
-        !isWorking && lastSyncConfig != nil && items.contains { $0.status == .error }
+        guard !isWorking,
+              let config = lastSyncConfig,
+              sourcePath == config.sourcePath,
+              destinationPath == config.destinationPath,
+              includeHiddenItems == config.includeHiddenItems,
+              includeRootDirectory == config.includeRootDirectory,
+              strictMD5 == config.strictMD5 else {
+            return false
+        }
+        return items.contains { $0.status == .error }
     }
 
     /// 重试上次同步中失败的项：用上次的配置快照重新执行完整同步。
@@ -138,6 +155,19 @@ final class FileCompareViewModel: ObservableObject {
         cancelCurrentWork?()
         elapsedRefreshTask?.cancel()
         elapsedRefreshTask = nil
+    }
+
+    /// 路径/选项变化后作废旧对比结果与重试快照，避免同步/重试作用于用户未审阅的文件集。
+    private func invalidateComparison(message: String? = nil) {
+        items = []
+        comparedItems = []
+        statistics = CompareStatistics(items: [])
+        mergeSummary = nil
+        errorMessage = nil
+        lastSyncConfig = nil
+        if let message {
+            statusMessage = message
+        }
     }
 
     func choosePath(_ side: PathSide) {
@@ -165,9 +195,10 @@ final class FileCompareViewModel: ObservableObject {
 
     /// 计算有效目标 URL：开启“包含本目录”时，把源目录以其自身文件夹名放入目标目录下，
     /// 即 `目标/<源目录名>`；否则直接用目标根。源目录始终以其根参与扫描/同步。
-    private func effectiveDestinationURL(sourcePath: String, destinationPath: String) -> URL {
+    /// `includeRoot` 显式传入：重试时必须使用上次快照，而不是界面的实时开关。
+    private func effectiveDestinationURL(sourcePath: String, destinationPath: String, includeRoot: Bool) -> URL {
         let base = URL(fileURLWithPath: destinationPath, isDirectory: true)
-        guard includeRootDirectory else { return base }
+        guard includeRoot else { return base }
         let sourceName = (sourcePath as NSString).lastPathComponent
         return base.appendingPathComponent(sourceName, isDirectory: true)
     }
@@ -293,7 +324,7 @@ final class FileCompareViewModel: ObservableObject {
         }
 
         let sourceURL = URL(fileURLWithPath: sourcePath, isDirectory: true)
-        let destinationURL = effectiveDestinationURL(sourcePath: sourcePath, destinationPath: destinationPath)
+        let destinationURL = effectiveDestinationURL(sourcePath: sourcePath, destinationPath: destinationPath, includeRoot: includeRootDirectory)
         let includeHiddenItemsSnapshot = includeHiddenItems
         let includeRootSnapshot = includeRootDirectory
         let strictMD5Snapshot = strictMD5
@@ -332,6 +363,8 @@ final class FileCompareViewModel: ObservableObject {
             do {
                 let allItems = try await compareTask.value
                 let differentItems = allItems.filter { $0.status != .same }
+                comparedItems = allItems
+                statistics = CompareStatistics(items: allItems)
                 items = differentItems
                 operationProgress = nil
                 statusMessage = "对比完成，共发现 \(differentItems.count) 个差异项（已隐藏相同文件/目录）。"
@@ -340,6 +373,8 @@ final class FileCompareViewModel: ObservableObject {
                 statusMessage = "对比已取消。"
             } catch {
                 items = []
+                comparedItems = []
+                statistics = CompareStatistics(items: [])
                 operationProgress = nil
                 errorMessage = error.localizedDescription
                 statusMessage = "对比失败。"
@@ -391,13 +426,13 @@ final class FileCompareViewModel: ObservableObject {
         case .leftToRight:
             // A → B：以 A 为源，目标按“包含本目录”决定是否包到 B/<A名> 下。
             sourceURL = URL(fileURLWithPath: effectiveSourcePath, isDirectory: true)
-            destinationURL = effectiveDestinationURL(sourcePath: effectiveSourcePath, destinationPath: effectiveDestinationPath)
+            destinationURL = effectiveDestinationURL(sourcePath: effectiveSourcePath, destinationPath: effectiveDestinationPath, includeRoot: includeRootSnapshot)
             statusPrefix = isRetry ? "正在重试失败项（\(modeText)：A → B）…" : "正在执行左向右\(modeText)：A → B…"
             successMessage = isRetry ? "重试完成。" : "\(modeText)完成，路径 B 已按路径 A 更新。"
         case .rightToLeft:
             // B → A：以 B 为源，目标按“包含本目录”决定是否包到 A/<B名> 下。
             sourceURL = URL(fileURLWithPath: effectiveDestinationPath, isDirectory: true)
-            destinationURL = effectiveDestinationURL(sourcePath: effectiveDestinationPath, destinationPath: effectiveSourcePath)
+            destinationURL = effectiveDestinationURL(sourcePath: effectiveDestinationPath, destinationPath: effectiveSourcePath, includeRoot: includeRootSnapshot)
             statusPrefix = isRetry ? "正在重试失败项（\(modeText)：B → A）…" : "正在执行右向左\(modeText)：B → A…"
             successMessage = isRetry ? "重试完成。" : "\(modeText)完成，路径 A 已按路径 B 更新。"
         }
@@ -440,9 +475,16 @@ final class FileCompareViewModel: ObservableObject {
             do {
                 let summary = try await syncTask.value
 
-                mergeSummary = summary
+                // B→A 的结果以 B 为源；镜像成统一的 A 为源视角后再展示，
+                // 否则表格的 A/B 列名、状态标题和可操作项方向会反转。
+                let resultItems = direction == .rightToLeft ? summary.items.map { $0.mirrored() } : summary.items
+                var displaySummary = summary
+                displaySummary.items = resultItems
+                mergeSummary = displaySummary
+                comparedItems = resultItems
+                statistics = CompareStatistics(items: resultItems)
                 // 直接复用同步过程中已按执行结果更新的 items，无需再扫一遍路径/重算 MD5。
-                items = summary.items.filter { $0.status != .same }
+                items = resultItems.filter { $0.status != .same }
                 operationProgress = nil
                 let actionText = isRetry ? "重试" : modeText
                 statusMessage = summary.hasErrors ? "\(actionText)完成，但有 \(summary.errors.count) 个错误。" : successMessage

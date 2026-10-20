@@ -14,6 +14,10 @@ final class FileMergeService: @unchecked Sendable {
         let size: Int64?
         /// 修改时间：非严格模式下与 size 联用做「快速判定相同」，跳过全量 MD5 读盘。
         let modificationDate: Date?
+        /// 符号链接：既不复制链接本身，也绝不能跟随写入。
+        let isSymbolicLink: Bool
+        /// FIFO / 设备 / 套接字：打开会阻塞或具有副作用，必须排除在同步之外。
+        let isSpecial: Bool
     }
 
     /// 预计算的对比结果（或读取失败时的错误），供并发哈希阶段产出、构造阶段消费。
@@ -26,12 +30,21 @@ final class FileMergeService: @unchecked Sendable {
         let error: Error?
     }
 
+    /// 一次目录扫描的结果。`skippedPrefixes` 记录无法读取的子目录（相对根目录），
+    /// 其下的条目必须标记为错误而不是按“对方不存在”处理，否则覆盖模式会误删目标内容。
+    private struct ScanResult: Sendable {
+        let nodes: [String: FileNode]
+        let skippedPrefixes: [String]
+    }
+
     /// 并发复制单个文件的结果，供 TaskGroup 收集后统一合并进 summary 与状态表。
     private struct FileCopyResult: Sendable {
         let itemID: String
         let overwritten: Bool   // 覆盖了已存在的目标
         let status: ComparisonStatus
         let message: String?
+        /// 是否属于“连接断开/挂载失效”类错误。只有这类错误才值得等待重连并整批重试。
+        let isDisconnect: Bool
     }
 
     /// 线程安全的 Int64 计数器：并发复制/哈希时汇总已处理字节数与条目数，供进度回调使用。
@@ -119,7 +132,7 @@ final class FileMergeService: @unchecked Sendable {
     /// 31 万文件同处一目录时，无缓存会逐文件发起 31 万次冗余往返（实测可达小时级）。
     /// 失败缓存让某目录首次创建失败后，其下所有文件直接跳过 createDirectory，
     /// 防止「单目录权限不足 → 整子树逐文件重复失败」的雪崩与错误刷屏。
-    private final class DirectoryCreationCache: @unchecked Sendable {
+    final class DirectoryCreationCache: @unchecked Sendable {
         private var succeeded = Set<String>()
         private var failed = Set<String>()
         private let lock = NSLock()
@@ -131,12 +144,21 @@ final class FileMergeService: @unchecked Sendable {
 
         func hasFailed(_ path: String) -> Bool {
             lock.lock(); defer { lock.unlock() }
-            return failed.contains(path)
+            return failed.contains(path) && !succeeded.contains(path)
         }
 
         func markSucceeded(_ path: String) {
             lock.lock(); defer { lock.unlock() }
-            succeeded.insert(path)
+            // 子路径创建成功证明其所有祖先目录都存在：清除失败标记，
+            // 否则一次瞬时失败会在目录已存在后继续毒化其下所有文件。
+            var current = path
+            while !current.isEmpty && current != "/" {
+                failed.remove(current)
+                succeeded.insert(current)
+                let parent = (current as NSString).deletingLastPathComponent
+                if parent == current { break }
+                current = parent
+            }
         }
 
         func markFailed(_ path: String) {
@@ -155,6 +177,10 @@ final class FileMergeService: @unchecked Sendable {
     private enum ServiceError: LocalizedError {
         case notDirectory(String)
         case nestedDirectory(source: String, destination: String)
+        /// 目录枚举失败。绝不能把这种情况当作空目录——覆盖模式会因此删除目标中的对应内容。
+        case unreadableDirectory(String)
+        /// 合并模式下源文件与目标目录同名：删除目录会丢失目标独有内容，必须拒绝。
+        case mergeTypeConflict(String)
         /// 父目录此前已创建失败（多为权限不足），其下文件直接跳过，避免逐文件重复 createDirectory 的雪崩。
         case parentDirectoryUnavailable(String)
 
@@ -164,6 +190,10 @@ final class FileMergeService: @unchecked Sendable {
                 return "不是有效目录：\(path)"
             case .nestedDirectory(let source, let destination):
                 return "路径 A 与路径 B 存在父子包含关系（\(source) ⊃/⊂ \(destination)），同步会导致内容无限嵌套复制或覆盖父目录文件，已拒绝。请选择两个互不包含的目录。"
+            case .unreadableDirectory(let path):
+                return "目录无法读取：\(path)。为避免把不可读目录误判为空目录并删除目标内容，已中止本次操作。"
+            case .mergeTypeConflict(let path):
+                return "合并时源路径「\(path)」是文件、目标是目录。为避免删除目标目录内容，已跳过该项；请改用「覆盖」或手动处理。"
             case .parentDirectoryUnavailable(let path):
                 return "父目录「\(path)」无法创建（可能无写权限），已跳过该目录下的文件。"
             }
@@ -174,6 +204,8 @@ final class FileMergeService: @unchecked Sendable {
 
     /// 进程级递增的临时文件序号：用于生成 temp 文件名后缀，比每文件生成 UUID 更轻、可预测。
     private static let tempCounter = AtomicInt64Counter()
+    /// 进程级唯一前缀：避免多个 App 实例在同一目录生成相同临时名。
+    private static let tempNamePrefix = String(UUID().uuidString.prefix(8)).lowercased()
 
     /// 并发上限。本地卷瓶颈是 CPU/磁盘，按 CPU 核数并发即可；网络卷（SMB/NFS 等）瓶颈是每文件的
     /// 网络往返（RTT）而非 CPU，必须让更多请求同时在途来重叠 RTT——用 CPU 核数限制会让网络链路严重欠载
@@ -224,10 +256,12 @@ final class FileMergeService: @unchecked Sendable {
         try validateNotNested(sourceRoot: sourceRoot, destinationRoot: destinationRoot)
 
         progress?(FileOperationProgress(phase: .scanningSource, message: FileProgressPhase.scanningSource.defaultMessage))
-        let sourceNodes = try scan(root: sourceRoot, includeHiddenItems: includeHiddenItems, phase: .scanningSource, progress: progress)
+        let sourceScan = try scan(root: sourceRoot, includeHiddenItems: includeHiddenItems, allowMissingRoot: false, phase: .scanningSource, progress: progress)
+        let sourceNodes = sourceScan.nodes
 
         progress?(FileOperationProgress(phase: .scanningDestination, message: FileProgressPhase.scanningDestination.defaultMessage))
-        let destinationNodes = try scan(root: destinationRoot, includeHiddenItems: includeHiddenItems, phase: .scanningDestination, progress: progress)
+        let destinationScan = try scan(root: destinationRoot, includeHiddenItems: includeHiddenItems, allowMissingRoot: destinationMayNotExist, phase: .scanningDestination, progress: progress)
+        let destinationNodes = destinationScan.nodes
 
         let allRelativePaths: [String]
         if sortForDisplay {
@@ -245,9 +279,16 @@ final class FileMergeService: @unchecked Sendable {
         // 仅大小相同但 mtime 不同（可能内容已变）的文件才回退 MD5。
         var fastSamePaths = Set<String>()
         let hashCandidates = Set(allRelativePaths.filter { relativePath in
+            // 位于不可读子树下的条目没有可信的对比结果，既不哈希也不参与同步。
+            guard !isUnderSkippedPrefix(relativePath, sourceScan.skippedPrefixes),
+                  !isUnderSkippedPrefix(relativePath, destinationScan.skippedPrefixes) else {
+                return false
+            }
             guard let source = sourceNodes[relativePath],
                   let destination = destinationNodes[relativePath],
-                  !source.isDirectory, !destination.isDirectory else {
+                  !source.isDirectory, !destination.isDirectory,
+                  !source.isSymbolicLink, !destination.isSymbolicLink,
+                  !source.isSpecial, !destination.isSpecial else {
                 return false
             }
             guard source.size == destination.size else { return false }
@@ -291,13 +332,22 @@ final class FileMergeService: @unchecked Sendable {
                 ))
             }
 
-            let item = buildComparisonItem(
+            var item = buildComparisonItem(
                 relativePath: relativePath,
                 source: sourceNodes[relativePath],
                 destination: destinationNodes[relativePath],
                 hashResult: hashResults[relativePath],
                 fastSame: fastSamePaths.contains(relativePath)
             )
+            // 不可读子目录下的条目无法可靠判断“对方是否存在”：必须标记为错误，
+            // 尤其覆盖模式绝不能把它们当作 onlyInDestination 删除。
+            if isUnderSkippedPrefix(relativePath, sourceScan.skippedPrefixes) {
+                item.status = .error
+                item.message = "源路径中的所在目录不可读，已跳过比较与同步，避免误删目标内容。"
+            } else if isUnderSkippedPrefix(relativePath, destinationScan.skippedPrefixes) {
+                item.status = .error
+                item.message = "目标路径中的所在目录不可读，已跳过比较与同步。"
+            }
             results.append(item)
         }
 
@@ -534,9 +584,9 @@ final class FileMergeService: @unchecked Sendable {
             ))
 
             if item.sourceURL == nil {
-                if deletesDestinationOnlyItems {
+                if deletesDestinationOnlyItems && item.status == .onlyInDestination {
                     do {
-                        try deleteDestinationOnlyItem(item: item, summary: &summary, isRemote: destinationIsRemote)
+                        try deleteDestinationOnlyItem(item: item, summary: &summary)
                         // 删除后两侧均无该项，视为一致。
                         finalStatus[item.id] = .same
                     } catch {
@@ -553,6 +603,16 @@ final class FileMergeService: @unchecked Sendable {
             let destinationURL = destinationRoot.appendingPathComponent(item.relativePath)
 
             do {
+                if !deletesDestinationOnlyItems,
+                   item.status == .typeMismatch,
+                   !item.isDirectory {
+                    var destinationIsDirectory: ObjCBool = false
+                    if fileManager.fileExists(atPath: destinationURL.path, isDirectory: &destinationIsDirectory),
+                       destinationIsDirectory.boolValue {
+                        throw ServiceError.mergeTypeConflict(item.relativePath)
+                    }
+                }
+
                 if item.isDirectory {
                     // 非空目录跳过显式创建（文件复制阶段会自动建父目录）；空目录与 typeMismatch 仍显式处理。
                     let needsExplicit = item.status == .typeMismatch || !directoriesWithFiles.contains(item.relativePath)
@@ -577,9 +637,8 @@ final class FileMergeService: @unchecked Sendable {
                         ))
                     }
                     // 非复制类文件（跳过/错误）不会回调，确保字节计数对齐实际大小。
-                    if item.status == .same {
-                        _ = completedCopyBytes.add(item.sourceSize ?? 0)
-                    }
+                    // 注意：.same 文件不参与 totalCopyBytes，不能把大小计入 completedCopyBytes，
+                    // 否则 completedBytes 会远超 totalBytes，进度条提前到 100%、平均速度虚高。
                     // 实际发生复制/覆盖的项，同步后两侧一致。
                     if item.status == .onlyInSource || item.status == .different || item.status == .typeMismatch {
                         finalStatus[item.id] = .same
@@ -607,7 +666,10 @@ final class FileMergeService: @unchecked Sendable {
                 progress: progress
             )
             for result in results {
-                if result.overwritten {
+                if result.status == .error {
+                    // 并发阶段失败必须进入 summary.errors，且不能计入“新增/覆盖成功”。
+                    summary.errors.append("\(result.itemID)：\(result.message ?? "复制失败")")
+                } else if result.overwritten {
                     summary.overwrittenFiles += 1
                 } else {
                     summary.copiedFiles += 1
@@ -674,6 +736,9 @@ final class FileMergeService: @unchecked Sendable {
             let batchEnd = min(index + concurrency, items.count)
             let batch = Array(items[index..<batchEnd])
 
+            // 记录批前字节水位：失败文件可能在中断前已上报部分字节，
+            // 整批重试时必须回滚，否则同一批字节会被重复计入进度与平均速度。
+            let bytesBeforeBatch = completedCopyBytes.current
             var batchResults = try await runCopyBatch(
                 batch: batch,
                 destinationRoot: destinationRoot,
@@ -687,15 +752,17 @@ final class FileMergeService: @unchecked Sendable {
             )
 
             // 连接断开恢复：网络卷（SMB/NFS 等）长时间复制后会话可能被服务器/macOS 断开，
-            // 表现为整批文件瞬间全失败。检测到「本批全失败」时等待重连，恢复后重试本批，
-            // 避免剩余文件雪崩失败、白费已复制的进度。本地卷无此问题，跳过。
-            // 全失败恰好保证字节计数无重复（失败未加字节），重试仅需减回 item 计数。
-            let allFailed = !batchResults.isEmpty && batchResults.allSatisfy { $0.status == .error }
+            // 表现为整批文件瞬间全失败。只有全部失败且都属于断线类错误时才等待重连，
+            // 恢复后回滚本批字节/条目计数并重试，避免重复计字节与无谓的权限错误等待。
+            // 本地卷无此问题，跳过。
+            let allFailed = !batchResults.isEmpty && batchResults.allSatisfy { $0.status == .error && $0.isDisconnect }
             if allFailed && isRemote {
                 let recovered = await waitForVolumeRecovery(root: destinationRoot, progress: progress)
                 if recovered {
-                    // 减回本批 item 计数（全失败时每项已 add(1)），清除连接断开导致的目录失败误判，重试本批。
+                    // 减回本批 item 计数（全失败时每项已 add(1)），并把字节计数回滚到批前水位，
+                    // 清除连接断开导致的目录失败误判，重试本批。
                     _ = completedItemsCounter.add(-Int64(batch.count))
+                    _ = completedCopyBytes.setValue(bytesBeforeBatch)
                     dirCache.clearFailures()
                     batchResults = try await runCopyBatch(
                         batch: batch,
@@ -713,7 +780,7 @@ final class FileMergeService: @unchecked Sendable {
                     results.append(contentsOf: batchResults)
                     for remainingIndex in (index + batch.count)..<items.count {
                         _ = completedItemsCounter.add(1)
-                        results.append(FileCopyResult(itemID: items[remainingIndex].id, overwritten: false, status: .error, message: "网络卷连接断开且未恢复，已跳过。"))
+                        results.append(FileCopyResult(itemID: items[remainingIndex].id, overwritten: false, status: .error, message: "网络卷连接断开且未恢复，已跳过。", isDisconnect: true))
                     }
                     break
                 }
@@ -789,13 +856,19 @@ final class FileMergeService: @unchecked Sendable {
                         // 把「复制期间被取消」转成 CancellationError 向上传播。
                         try Task.checkCancellation()
                         _ = completedItemsCounter.add(1)
-                        return FileCopyResult(itemID: item.id, overwritten: destinationExists, status: .same, message: nil)
+                        return FileCopyResult(itemID: item.id, overwritten: destinationExists, status: .same, message: nil, isDisconnect: false)
                     } catch is CancellationError {
                         // 取消向上传播：TaskGroup 会自动取消其余子任务并把异常抛给调用方。
                         throw CancellationError()
                     } catch {
                         _ = completedItemsCounter.add(1)
-                        return FileCopyResult(itemID: item.id, overwritten: false, status: .error, message: Self.friendlyMessage(for: error, isRemote: isRemote))
+                        return FileCopyResult(
+                            itemID: item.id,
+                            overwritten: false,
+                            status: .error,
+                            message: Self.friendlyMessage(for: error, isRemote: isRemote),
+                            isDisconnect: Self.isDisconnectError(error)
+                        )
                     }
                 }
             }
@@ -918,11 +991,11 @@ final class FileMergeService: @unchecked Sendable {
         }
     }
 
-    /// 拒绝源/目标互为父子目录。标准化路径后比较前缀（带路径分隔符边界），
-    /// 避免误判 `/x/ab` 与 `/x/a`。任一方尚不存在时跳过该方向检查。
+    /// 拒绝源/目标互为父子目录。解析符号链接（含最长已存在祖先）后比较路径前缀（带分隔符边界），
+    /// 避免误判 `/x/ab` 与 `/x/a`，也避免符号链接/别名路径绕过检查。
     private func validateNotNested(sourceRoot: URL, destinationRoot: URL) throws {
-        let sourcePath = sourceRoot.standardizedFileURL.path
-        let destinationPath = destinationRoot.standardizedFileURL.path
+        let sourcePath = canonicalPath(sourceRoot)
+        let destinationPath = canonicalPath(destinationRoot)
         if isAncestor(sourcePath, of: destinationPath) || isAncestor(destinationPath, of: sourcePath) {
             throw ServiceError.nestedDirectory(source: sourcePath, destination: destinationPath)
         }
@@ -930,8 +1003,10 @@ final class FileMergeService: @unchecked Sendable {
 
     /// `ancestor` 是否是 `descendant` 的前缀目录（含相等）。标准化路径无尾斜杠，
     /// 故以 `ancestor + "/"` 作前缀判断，避免 `/x/a` 误判为 `/x` 的后代。
-    private func isAncestor(_ ancestor: String, of descendant: String) -> Bool {
+    /// 根路径 "/" 需要特殊处理，否则会拼出 "//" 而永远匹配不到。
+    func isAncestor(_ ancestor: String, of descendant: String) -> Bool {
         if descendant == ancestor { return true }
+        if ancestor == "/" { return descendant.hasPrefix("/") }
         return descendant.hasPrefix(ancestor + "/")
     }
 
@@ -946,49 +1021,65 @@ final class FileMergeService: @unchecked Sendable {
         return abs(sourceDate.timeIntervalSince(destinationDate)) <= 1
     }
 
-    private func scan(root: URL, includeHiddenItems: Bool, phase: FileProgressPhase, progress: ProgressHandler?) throws -> [String: FileNode] {
+    private func scan(root: URL, includeHiddenItems: Bool, allowMissingRoot: Bool, phase: FileProgressPhase, progress: ProgressHandler?) throws -> ScanResult {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .fileSizeKey, .isSymbolicLinkKey, .contentModificationDateKey]
-        // 收集无法访问的子目录（多为权限不足）：errorHandler 返回 true 跳过该子树继续扫描，
-        // 避免 nil 时静默吞掉、用户不知道有目录被跳过；末尾汇总上报一次数量。
-        var skippedSubtrees: [String] = []
+        // 用 realpath 统一根路径：Foundation 的 resolvingSymlinksInPath 对 /tmp 可能仍返回 /tmp，
+        // 而 enumerator 实际产出 /private/tmp/...，前缀不匹配会让相对路径退化成文件名。
+        let rootPath = canonicalPath(root)
+        let rootExists = fileManager.fileExists(atPath: root.path)
+        let enumerationRoot = URL(fileURLWithPath: rootPath, isDirectory: true)
+
+        // 收集无法访问的路径：根目录失败必须中止；子目录失败记录相对前缀，
+        // 其下条目随后标记为 error，绝不能被当作“对方不存在”。
+        var failedPaths: [String] = []
+        var rootFailed = false
         guard let enumerator = fileManager.enumerator(
-            at: root,
+            at: enumerationRoot,
             includingPropertiesForKeys: keys,
             options: [],
             errorHandler: { url, _ in
-                skippedSubtrees.append(url.path)
+                let path = self.canonicalPath(url)
+                if path == rootPath {
+                    rootFailed = true
+                } else {
+                    failedPaths.append(path)
+                }
                 return true
             }
         ) else {
-            return [:]
+            if allowMissingRoot && !rootExists {
+                return ScanResult(nodes: [:], skippedPrefixes: [])
+            }
+            throw ServiceError.unreadableDirectory(root.path)
         }
 
         var nodes: [String: FileNode] = [:]
         var scannedCount = 0
-        // root 标准化一次，循环内只标准化每个 url，避免逐项重复计算。
-        let rootPath = root.standardizedFileURL.path
         // resourceValues 的 key 集合在循环外构建一次，避免逐文件重复分配 Set。
         let resourceKeys = Set(keys)
         for case let url as URL in enumerator {
             try Task.checkCancellation()
             // 在 Swift 并发线程上没有 autorelease pool，FileManager/URL 调用产生的
             // autorelease 对象会一直堆积。逐项包 autoreleasepool 及时排空，避免内存随扫描增长。
-            let (relativePath, isDirectory, fileSize, modificationDate, isSymbolicLink): (String, Bool, Int64?, Date?, Bool) = try autoreleasepool {
-                let values = try url.resourceValues(forKeys: resourceKeys)
-                let relativePath = makeRelativePath(for: url, rootPath: rootPath)
-                let isDirectory = values.isDirectory == true
-                let fileSize = isDirectory ? nil : Int64(values.fileSize ?? 0)
-                let modificationDate = values.contentModificationDate
-                let isSymbolicLink = values.isSymbolicLink == true
-                return (relativePath, isDirectory, fileSize, modificationDate, isSymbolicLink)
-            }
-            guard !relativePath.isEmpty else { continue }
-
-            // 跳过符号链接：避免跟随目标造成跨目录复制或符号链接环死循环。
-            if isSymbolicLink {
-                if isDirectory {
-                    enumerator.skipDescendants()
+            // 单个条目在扫描期间消失/不可 stat 时只跳过该条目，不能让整次操作失败。
+            let scanned: (String, Bool, Int64?, Date?, Bool, Bool, Bool)? = autoreleasepool {
+                do {
+                    let values = try url.resourceValues(forKeys: resourceKeys)
+                    let relativePath = makeRelativePath(for: url, rootPath: rootPath)
+                    let isDirectory = values.isDirectory == true
+                    let isRegularFile = values.isRegularFile == true
+                    let isSymbolicLink = values.isSymbolicLink == true
+                    let isSpecial = !isDirectory && !isRegularFile && !isSymbolicLink
+                    let fileSize = isDirectory ? nil : Int64(values.fileSize ?? 0)
+                    let modificationDate = values.contentModificationDate
+                    return (relativePath, isDirectory, fileSize, modificationDate, isSymbolicLink, isRegularFile, isSpecial)
+                } catch {
+                    return nil
                 }
+            }
+            guard let (relativePath, isDirectory, fileSize, modificationDate, isSymbolicLink, _, isSpecial) = scanned,
+                  !relativePath.isEmpty else {
+                failedPaths.append(canonicalPath(url))
                 continue
             }
 
@@ -1013,16 +1104,31 @@ final class FileMergeService: @unchecked Sendable {
                 relativePath: relativePath,
                 url: url,
                 isDirectory: isDirectory,
-                size: fileSize,
-                modificationDate: modificationDate
+                size: isSpecial ? nil : fileSize,
+                modificationDate: modificationDate,
+                isSymbolicLink: isSymbolicLink,
+                isSpecial: isSpecial
             )
         }
 
+        // 根目录本身不可读：缺失目标目录（allowMissingRoot）可以接受，其余一律中止。
+        if rootFailed {
+            if allowMissingRoot && !rootExists {
+                return ScanResult(nodes: [:], skippedPrefixes: [])
+            }
+            throw ServiceError.unreadableDirectory(root.path)
+        }
+
+        let skippedPrefixes = failedPaths.compactMap { path -> String? in
+            let relative = makeRelativePath(for: URL(fileURLWithPath: path), rootPath: rootPath)
+            return relative.isEmpty ? nil : relative
+        }
+
         let finalMessage: String
-        if skippedSubtrees.isEmpty {
+        if skippedPrefixes.isEmpty {
             finalMessage = phase.defaultMessage
         } else {
-            finalMessage = "扫描完成，跳过 \(skippedSubtrees.count) 个无法访问的子目录（可能无权限）。"
+            finalMessage = "扫描完成，跳过 \(skippedPrefixes.count) 个无法访问的子目录（可能无权限），其下内容不会参与同步。"
         }
         progress?(FileOperationProgress(
             phase: phase,
@@ -1031,7 +1137,17 @@ final class FileMergeService: @unchecked Sendable {
             currentPath: nil,
             message: finalMessage
         ))
-        return nodes
+        return ScanResult(nodes: nodes, skippedPrefixes: skippedPrefixes)
+    }
+
+    /// `relativePath` 是否等于或位于任一不可读前缀之下。
+    private func isUnderSkippedPrefix(_ relativePath: String, _ prefixes: [String]) -> Bool {
+        for prefix in prefixes {
+            if relativePath == prefix || relativePath.hasPrefix(prefix + "/") {
+                return true
+            }
+        }
+        return false
     }
 
     private func buildComparisonItem(
@@ -1042,6 +1158,23 @@ final class FileMergeService: @unchecked Sendable {
         fastSame: Bool = false
     ) -> FileComparisonItem {
         let isDirectory = source?.isDirectory ?? destination?.isDirectory ?? false
+
+        // FIFO/设备/套接字打开会阻塞或具有副作用：显式标错，绝不进入复制/哈希路径。
+        if source?.isSpecial == true || destination?.isSpecial == true {
+            return FileComparisonItem(
+                id: relativePath,
+                relativePath: relativePath,
+                sourceURL: source?.url,
+                destinationURL: destination?.url,
+                isDirectory: isDirectory,
+                sourceSize: source?.size,
+                destinationSize: destination?.size,
+                sourceMD5: nil,
+                destinationMD5: nil,
+                status: .error,
+                message: "特殊文件（FIFO/设备/套接字）不参与同步。"
+            )
+        }
 
         guard let source else {
             return FileComparisonItem(
@@ -1059,6 +1192,38 @@ final class FileMergeService: @unchecked Sendable {
             )
         }
 
+        // 源路径是符号链接：不复制链接本身，也不跟随目标复制内容。
+        if source.isSymbolicLink {
+            if let destination, destination.isSymbolicLink {
+                return FileComparisonItem(
+                    id: relativePath,
+                    relativePath: relativePath,
+                    sourceURL: source.url,
+                    destinationURL: destination.url,
+                    isDirectory: false,
+                    sourceSize: nil,
+                    destinationSize: nil,
+                    sourceMD5: nil,
+                    destinationMD5: nil,
+                    status: .same,
+                    message: "两侧均为符号链接，已跳过。"
+                )
+            }
+            return FileComparisonItem(
+                id: relativePath,
+                relativePath: relativePath,
+                sourceURL: source.url,
+                destinationURL: destination?.url,
+                isDirectory: false,
+                sourceSize: nil,
+                destinationSize: destination?.size,
+                sourceMD5: nil,
+                destinationMD5: nil,
+                status: .error,
+                message: "源路径是符号链接，不参与同步；目标内容保持不变。"
+            )
+        }
+
         guard let destination else {
             return FileComparisonItem(
                 id: relativePath,
@@ -1072,6 +1237,23 @@ final class FileMergeService: @unchecked Sendable {
                 destinationMD5: nil,
                 status: .onlyInSource,
                 message: "路径 A 中存在，路径 B 中不存在；合并时会复制到 B。"
+            )
+        }
+
+        // 目标同名路径是符号链接：用源文件/目录替换链接本身（removeItem 只删除链接，不触及目标）。
+        if destination.isSymbolicLink && !source.isSymbolicLink {
+            return FileComparisonItem(
+                id: relativePath,
+                relativePath: relativePath,
+                sourceURL: source.url,
+                destinationURL: destination.url,
+                isDirectory: source.isDirectory,
+                sourceSize: source.size,
+                destinationSize: nil,
+                sourceMD5: nil,
+                destinationMD5: nil,
+                status: .typeMismatch,
+                message: "目标同名路径是符号链接，合并/覆盖时会用源路径替换链接本身。"
             )
         }
 
@@ -1265,19 +1447,15 @@ final class FileMergeService: @unchecked Sendable {
         }
     }
 
-    private func deleteDestinationOnlyItem(item: FileComparisonItem, summary: inout MergeSummary, isRemote: Bool) throws {
+    private func deleteDestinationOnlyItem(item: FileComparisonItem, summary: inout MergeSummary) throws {
         guard let destinationURL = item.destinationURL else { return }
         guard fileManager.fileExists(atPath: destinationURL.path) else { return }
 
-        do {
-            try fileManager.removeItem(at: destinationURL)
-            if item.isDirectory {
-                summary.deletedDirectories += 1
-            } else {
-                summary.deletedFiles += 1
-            }
-        } catch {
-            summary.errors.append("\(item.relativePath)：删除失败：\(Self.friendlyMessage(for: error, isRemote: isRemote))")
+        try fileManager.removeItem(at: destinationURL)
+        if item.isDirectory {
+            summary.deletedDirectories += 1
+        } else {
+            summary.deletedFiles += 1
         }
     }
 
@@ -1306,10 +1484,8 @@ final class FileMergeService: @unchecked Sendable {
     /// 逐块对比两端文件内容是否相同：同位置读等长块、逐块比较，首块不同即返回 false。
     /// 与「两端全量 MD5 再比」相比：差异文件首块即停、省下几乎全部读盘与哈希计算；
     /// 相同文件两端都需完整读一次（读盘量与两端 MD5 相同，但省去哈希计算）。
-    /// 调用方已保证两端大小相同，故任一端读到末尾即视为比对完毕且相同。
-    /// `sourceSize`/`destinationSize` 用于在差异文件提前退出时补报两端未读字节，
-    /// 使 hashing 字节进度能收尾到 100%（与 totalHashBytes 的源+目口径对齐）。
-    private func streamsEqual(
+    /// 大小来自扫描快照；双端同时 EOF 才视为相同，单端提前 EOF 说明文件在比较期间被修改，返回 false。
+    func streamsEqual(
         sourceURL: URL,
         destinationURL: URL,
         sourceSize: Int64,
@@ -1329,10 +1505,12 @@ final class FileMergeService: @unchecked Sendable {
             // 直接 != 比较才不会被短读导致的长度差误判为内容不同（网络卷上短读常见）。
             let sourceData = try readFullChunk(from: sourceHandle, count: Self.ioChunkSize, isCancelled: isCancelled)
             let destData = try readFullChunk(from: destinationHandle, count: Self.ioChunkSize, isCancelled: isCancelled)
-            // 双端大小相同：任一到末尾即比对完毕且此前各块均相同。
+            // 两端大小相同（扫描时）：双端同时 EOF 才代表内容一致。
+            // 单端提前 EOF 说明文件在扫描后被修改（增长/截断），绝不能误判为相同。
             if sourceData.isEmpty || destData.isEmpty {
-                // 相同文件正常读到末尾，逐块已上报；空文件（首块即空）需补报两端 0 字节，无副作用。
-                return true
+                onBytesRead?(Int64(sourceData.count))
+                onBytesRead?(Int64(destData.count))
+                return sourceData.isEmpty && destData.isEmpty
             }
             sourceRead += Int64(sourceData.count)
             destRead += Int64(destData.count)
@@ -1406,6 +1584,9 @@ final class FileMergeService: @unchecked Sendable {
                 onBytesCopied?(fileSize)
                 return
             } catch {
+                // copyItem 可能在失败前留下部分目标文件。先清理，再走分块路径；
+                // 否则后续 moveItem(temp → destination) 会因目标已存在而永久失败。
+                try? fileManager.removeItem(at: destinationURL)
                 // copyItem 失败（如偶发连接抖动）回退到分块路径，保证健壮性。
             }
         }
@@ -1597,28 +1778,25 @@ final class FileMergeService: @unchecked Sendable {
         }
     }
 
-    /// 在目标同目录生成临时文件 URL（同卷，保证 rename 原子）。名字带固定前缀 + 进程级自增序号，
-    /// 既便于辨识，又避免并发复制或残留 temp 文件撞名覆盖。序号比每文件生成 UUID 更轻。
+    /// 在目标同目录生成临时文件 URL（同卷，保证 rename 原子）。
+    /// 名字不拼接目标文件名——合法文件名可达 NAME_MAX（255 字节），追加后缀会让长文件名永远无法复制。
     private func makeTempURL(nextTo destinationURL: URL) -> URL {
         let directory = destinationURL.deletingLastPathComponent()
-        let baseName = destinationURL.lastPathComponent
         let token = Self.tempCounter.add(1)
-        return directory.appendingPathComponent(".\(baseName).filesync-\(token)-tmp")
+        return directory.appendingPathComponent(".\(Self.tempNamePrefix)-\(token)-tmp")
     }
 
-    /// 网络卷 replaceItem 回退时旧目标的备份名：同目录、带固定前缀 + 进程级序号，便于辨识与清理。
-    /// 序号避免并发复制或上次回退残留的 backup 撞名，导致 moveItem 覆盖失败。
+    /// 网络卷 replaceItem 回退时旧目标的备份名：同目录、进程唯一前缀 + 序号，便于辨识与清理。
     private func makeBackupURL(for destinationURL: URL) -> URL {
         let directory = destinationURL.deletingLastPathComponent()
-        let baseName = destinationURL.lastPathComponent
         let token = Self.tempCounter.add(1)
-        return directory.appendingPathComponent(".\(baseName).filesync-\(token)-backup")
+        return directory.appendingPathComponent(".\(Self.tempNamePrefix)-\(token)-backup")
     }
 
-    /// 判断目标所在卷是否为网络/远程文件系统（SMB/NFS/AFP/WebDAV 等）。用父目录查询 statfs，
-    /// 因为目标文件可能尚未创建；父目录在复制前已确保存在。
+    /// 判断目标所在卷是否为网络/远程文件系统（SMB/NFS/AFP/WebDAV 等）。
+    /// 路径存在时直接 statfs 该路径（目标根可能就是网络卷挂载点）；不存在时退回父目录。
     private func isRemoteVolume(_ url: URL) -> Bool {
-        let path = url.deletingLastPathComponent().path
+        let path = statfsPath(for: url)
         var buf = statfs()
         guard statfs(path, &buf) == 0 else { return false }
         let fstype = withUnsafePointer(to: &buf.f_fstypename) { ptr in
@@ -1627,52 +1805,131 @@ final class FileMergeService: @unchecked Sendable {
         return Self.networkFilesystems.contains(fstype)
     }
 
-    /// 用临时文件原子覆盖目标。`destinationExists` 由对比结果得知，免去一次 fileExists 网络往返：
-    /// 目标存在时走 `FileManager.replaceItem`（同卷原子替换，无「先删后移」的目标缺失窗口）；
-    /// 目标不存在时直接 move。
+    /// 选择用于 statfs 的路径：文件/目录本身存在时直接用它（目标根可能就是网络卷挂载点，
+    /// 用父目录会把 /Volumes/SMBShare 误判为本地盘）；不存在时才退回父目录。
+    func statfsPath(for url: URL) -> String {
+        let path = url.path
+        if fileManager.fileExists(atPath: path) {
+            return path
+        }
+        return url.deletingLastPathComponent().path
+    }
+
+    /// 判断错误是否属于“网络卷断开/挂载失效”。只有这类错误才应触发等待重连与整批重试；
+    /// 权限不足、只读共享等持续性错误如果也走恢复流程，会在每批白等 2 秒并清空失败缓存。
+    static func isDisconnectError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            switch Int32(nsError.code) {
+            case ENOTCONN, ECONNRESET, ETIMEDOUT, ESTALE, EIO, ENETDOWN, ENETUNREACH, EHOSTDOWN, EHOSTUNREACH, EPIPE:
+                return true
+            default:
+                return false
+            }
+        }
+        if nsError.domain == NSCocoaErrorDomain {
+            // 260 = NSFileReadNoSuchFileError，4 = NSFileNoSuchFileError：
+            // 复制前刚验证过的路径突然消失，通常意味着挂载点掉线。
+            return nsError.code == 260 || nsError.code == 4
+        }
+        return false
+    }
+
+    /// 用临时文件原子覆盖目标。`destinationExists` 由对比结果得知，正常路径下免去一次 fileExists 网络往返；
+    /// 但目标可能在此期间被创建（符号链接、上一次失败留下的部分文件、大小写不敏感卷上的同名文件），
+    /// 因此「目标不存在」路径失败时会回退到与覆盖相同的备份+移入流程，而不是让该文件永久失败。
     @discardableResult
     private func replaceItem(at destinationURL: URL, with tempURL: URL, destinationExists: Bool) throws -> URL {
         if destinationExists {
-            // 同卷原子替换优先：replaceItem 把 temp 整体替换到目标位置，无「先删后移」的目标缺失窗口。
-            // 但网络卷（SMB/NFS 等）不支持原子替换语义，replaceItem 常抛 NSFileWriteNoPermissionError。
-            // 安全回退：先把旧目标改名备份，再把 temp 移到位；移动失败则恢复备份——
-            // 杜绝「旧文件已删、新文件没移成」的数据丢失（直接 remove+move 会有此窗口）。
-            var resultingURL: NSURL?
-            do {
-                try fileManager.replaceItem(at: destinationURL, withItemAt: tempURL, backupItemName: nil, options: [], resultingItemURL: &resultingURL)
-            } catch {
-                let backupURL = makeBackupURL(for: destinationURL)
-                // 旧目标改不动（只读/锁定）：直接尝试覆盖式移动，多数 SMB 实现支持 move 覆盖。
-                // 此分支若失败，原目标仍在（备份没移走），temp 由外层清理，无数据丢失。
-                do {
-                    try fileManager.moveItem(at: destinationURL, to: backupURL)
-                } catch {
-                    try fileManager.moveItem(at: tempURL, to: destinationURL)
-                    return destinationURL
-                }
-                // 旧目标已备份移走，目标位置此刻为空，temp 移入应成功；失败则恢复备份保住原数据。
-                do {
-                    try fileManager.moveItem(at: tempURL, to: destinationURL)
-                    try? fileManager.removeItem(at: backupURL)
-                } catch {
-                    try? fileManager.moveItem(at: backupURL, to: destinationURL)
-                    throw error
-                }
-            }
+            try replaceExistingItem(at: destinationURL, with: tempURL)
         } else {
-            try fileManager.moveItem(at: tempURL, to: destinationURL)
+            do {
+                try fileManager.moveItem(at: tempURL, to: destinationURL)
+            } catch {
+                try replaceExistingItem(at: destinationURL, with: tempURL)
+            }
         }
         return destinationURL
     }
 
+    /// 覆盖已存在目标：优先原子 replaceItem；网络卷不支持时改为「旧目标改名备份 → 移入新文件 → 失败恢复」。
+    private func replaceExistingItem(at destinationURL: URL, with tempURL: URL) throws {
+        var resultingURL: NSURL?
+        do {
+            try fileManager.replaceItem(at: destinationURL, withItemAt: tempURL, backupItemName: nil, options: [], resultingItemURL: &resultingURL)
+            return
+        } catch {
+            let backupURL = makeBackupURL(for: destinationURL)
+            do {
+                try fileManager.moveItem(at: destinationURL, to: backupURL)
+            } catch {
+                // 旧目标无法移走（只读/锁定）：尝试直接移入。只有目标实际不存在时才会成功；
+                // 若目标仍在，moveItem 会以 516 失败，原目标与临时文件均不受损。
+                try fileManager.moveItem(at: tempURL, to: destinationURL)
+                return
+            }
+            // 旧目标已备份移走，目标位置此刻为空；失败则恢复备份保住原数据。
+            do {
+                try fileManager.moveItem(at: tempURL, to: destinationURL)
+                try? fileManager.removeItem(at: backupURL)
+            } catch {
+                try? fileManager.moveItem(at: backupURL, to: destinationURL)
+                throw error
+            }
+        }
+    }
+
     private func makeRelativePath(for url: URL, rootPath: String) -> String {
         let fullPath = url.standardizedFileURL.path
-        guard fullPath.hasPrefix(rootPath) else { return url.lastPathComponent }
-
-        var relative = String(fullPath.dropFirst(rootPath.count))
-        if relative.hasPrefix("/") {
-            relative.removeFirst()
+        if fullPath.hasPrefix(rootPath) {
+            var relative = String(fullPath.dropFirst(rootPath.count))
+            if relative.hasPrefix("/") {
+                relative.removeFirst()
+            }
+            return relative
         }
-        return relative
+
+        // 兜底：解析符号链接后重试（enumerator 与传入根路径可能一个已解析、一个未解析）。
+        // 不能直接退化成 lastPathComponent——那会让不同子目录下的同名文件互相覆盖。
+        let canonical = canonicalPath(url)
+        if canonical.hasPrefix(rootPath) {
+            var relative = String(canonical.dropFirst(rootPath.count))
+            if relative.hasPrefix("/") {
+                relative.removeFirst()
+            }
+            return relative
+        }
+        return url.lastPathComponent
+    }
+
+    /// 解析全部符号链接后的绝对路径。路径尚不存在时，解析「最长的已存在祖先」再拼回缺失部分——
+    /// 否则 realpath 整体失败会让指向源目录的符号链接前缀逃过父子关系校验。
+    func canonicalPath(_ url: URL) -> String {
+        var existing = url.standardizedFileURL
+        var missingComponents: [String] = []
+        while !fileManager.fileExists(atPath: existing.path) {
+            let parent = existing.deletingLastPathComponent()
+            if parent.path == existing.path { break }
+            missingComponents.append(existing.lastPathComponent)
+            existing = parent
+        }
+
+        let resolvedExisting: String
+        if let resolved = realpath(existing.path, nil) {
+            resolvedExisting = String(cString: resolved)
+            free(resolved)
+        } else {
+            resolvedExisting = existing.path
+        }
+
+        var result = resolvedExisting
+        for component in missingComponents.reversed() {
+            if result == "/" {
+                result += component
+            } else {
+                result += "/" + component
+            }
+        }
+        return result
     }
 }

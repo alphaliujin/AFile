@@ -82,6 +82,7 @@ xcodebuild -version
 │   ├── Info.plist                              # App 元信息
 │   └── Alpha的文件同步工具.entitlements               # 签名/权限配置
 ├── build_dmg.sh                                # 一键构建并生成 DMG
+├── Tests/                                      # 核心逻辑回归测试（独立编译，无需 Xcode 测试 target）
 ├── build/                                      # 构建输出，脚本运行后生成
 └── README.md
 ```
@@ -153,6 +154,16 @@ lipo -info build/Export/Alpha的文件同步工具.app/Contents/MacOS/Alpha的�
 Architectures in the fat file: ... are: x86_64 arm64
 ```
 
+### 方式四：运行核心逻辑测试
+
+测试直接编译 `FileMergeService` / `FileComparisonModels` / `FileCompareViewModel`，无需 Xcode 测试 target：
+
+```bash
+bash Tests/run_tests.sh
+```
+
+覆盖扫描失败保护、符号链接与特殊文件、父子目录校验、长文件名、进度字节计数、重试配置、B→A 镜像、统计口径等回归场景。
+
 ## 合并与覆盖规则详解
 
 点击 `合并` 或 `覆盖` 后，程序会重新扫描并按所选方向执行。方向可以是 A → B，也可以是 B → A。
@@ -163,8 +174,10 @@ Architectures in the fat file: ... are: x86_64 arm64
 | 仅目标路径存在 | 保留，不删除 | 删除目标路径独有文件/文件夹 |
 | 相同 | MD5 相同，跳过 | MD5 相同，跳过 |
 | MD5 不同 | 用源路径覆盖目标路径 | 用源路径覆盖目标路径 |
-| 类型冲突 | 删除目标中同名路径，再复制/创建源路径 | 删除目标中同名路径，再复制/创建源路径 |
+| 类型冲突 | 源目录 vs 目标文件：删除文件并建目录；源文件 vs 目标目录：跳过并报错（保留目标目录内容） | 删除目标中同名路径，再复制/创建源路径 |
 | 错误 | 跳过并记录错误 | 跳过并记录错误 |
+
+> 符号链接不参与内容同步：两侧都是链接时跳过；源是链接时保留目标不动；目标同名路径是链接时用源路径替换链接本身。覆盖模式会删除目标独有的符号链接（只删链接，不触及链接指向的文件）。
 
 目录会优先创建；删除目标独有目录时会先删除子项，再删除父目录。
 

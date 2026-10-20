@@ -54,6 +54,45 @@ struct FileComparisonItem: Identifiable, Sendable {
             return false
         }
     }
+
+    /// 把「以 B 为源」的同步结果镜像成界面统一的「A 为源」视角：
+    /// 交换两侧 URL/大小/MD5，并交换仅源/仅目标状态，使 B→A 操作后的表格仍然语义正确。
+    func mirrored() -> FileComparisonItem {
+        let mirroredStatus: ComparisonStatus
+        switch status {
+        case .onlyInSource: mirroredStatus = .onlyInDestination
+        case .onlyInDestination: mirroredStatus = .onlyInSource
+        default: mirroredStatus = status
+        }
+
+        let mirroredMessage: String?
+        switch status {
+        case .error:
+            mirroredMessage = message
+        case .onlyInSource:
+            mirroredMessage = "路径 B 中存在，路径 A 中不存在；左向右合并时会保留。"
+        case .onlyInDestination:
+            mirroredMessage = "路径 A 中存在，路径 B 中不存在；合并时会复制到 B。"
+        case .typeMismatch:
+            mirroredMessage = "A 与 B 的同名路径类型不同；合并时会用 A 覆盖 B。"
+        case .same, .different:
+            mirroredMessage = message
+        }
+
+        return FileComparisonItem(
+            id: id,
+            relativePath: relativePath,
+            sourceURL: destinationURL,
+            destinationURL: sourceURL,
+            isDirectory: isDirectory,
+            sourceSize: destinationSize,
+            destinationSize: sourceSize,
+            sourceMD5: destinationMD5,
+            destinationMD5: sourceMD5,
+            status: mirroredStatus,
+            message: mirroredMessage
+        )
+    }
 }
 
 /// 左向右合并结果。

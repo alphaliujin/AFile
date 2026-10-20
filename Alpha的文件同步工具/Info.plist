@@ -31,5 +31,15 @@
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>用于对比和同步桌面中的文件夹。</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>用于对比和同步文稿中的文件夹。</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>用于对比和同步下载中的文件夹。</string>
+    <key>NSNetworkVolumesUsageDescription</key>
+    <string>用于对比和同步网络共享卷中的文件夹。</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>用于对比和同步外接磁盘中的文件夹。</string>
 </dict>
 </plist>

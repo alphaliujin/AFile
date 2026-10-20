@@ -365,6 +365,22 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, alignment: .trailing)
                 }
             }
+
+            // 完成状态与汇总：同步结束后展示新增/覆盖/删除计数与错误数，
+            // 对比结束后展示结果提示。此前这些状态只写入 ViewModel、从未渲染。
+            HStack(spacing: 8) {
+                if let summary = viewModel.mergeSummary {
+                    Text(summary.userMessage)
+                        .foregroundStyle(summary.hasErrors ? Color.red : Color.secondary)
+                } else {
+                    Text(viewModel.statusMessage)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .font(.caption)
+            .lineLimit(1)
+            .truncationMode(.tail)
         }
     }
 
