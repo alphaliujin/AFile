@@ -10,6 +10,7 @@ swiftc -parse-as-library -O \
   "${ROOT}/Alpha的文件同步工具/FileCompareViewModel.swift" \
   "${ROOT}/Tests/TestSupport.swift" \
   "${ROOT}/Tests/MergeServiceTests.swift" \
+  "${ROOT}/Tests/Benchmark.swift" \
   -o "${OUT}"
 
 "${OUT}" "$@"

@@ -840,6 +840,7 @@ final class FileMergeService: @unchecked Sendable {
                                 sourceURL: sourceURL,
                                 destinationURL: destinationURL,
                                 destinationExists: destinationExists,
+                                sourceSize: fileSize,
                                 dirCache: dirCache,
                                 isCancelled: { cancellationFlag.isSet },
                                 isRemote: isRemote,
@@ -955,6 +956,7 @@ final class FileMergeService: @unchecked Sendable {
         sourceURL: URL,
         destinationURL: URL,
         destinationExists: Bool,
+        sourceSize: Int64,
         dirCache: DirectoryCreationCache,
         isCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled },
         isRemote: Bool? = nil,
@@ -976,7 +978,7 @@ final class FileMergeService: @unchecked Sendable {
                 throw error
             }
         }
-        try copyFileWithProgress(from: sourceURL, to: destinationURL, destinationExists: destinationExists, isCancelled: isCancelled, isRemote: isRemote, onBytesCopied: onBytesCopied)
+        try copyFileWithProgress(from: sourceURL, to: destinationURL, destinationExists: destinationExists, sourceSize: sourceSize, isCancelled: isCancelled, isRemote: isRemote, onBytesCopied: onBytesCopied)
     }
 
     private func validateDirectory(_ url: URL, allowMissing: Bool = false) throws {
@@ -1439,7 +1441,7 @@ final class FileMergeService: @unchecked Sendable {
 
         // 目标是否已存在可由对比结果直接得知（destinationURL 非空即存在），免去一次网络 fileExists 往返。
         let destinationExists = item.destinationURL != nil
-        try copyFileWithProgress(from: sourceURL, to: destinationURL, destinationExists: destinationExists, isRemote: isRemote, onBytesCopied: onBytesCopied)
+        try copyFileWithProgress(from: sourceURL, to: destinationURL, destinationExists: destinationExists, sourceSize: item.sourceSize ?? 0, isRemote: isRemote, onBytesCopied: onBytesCopied)
         if destinationExists {
             summary.overwrittenFiles += 1
         } else {
@@ -1447,16 +1449,38 @@ final class FileMergeService: @unchecked Sendable {
         }
     }
 
-    private func deleteDestinationOnlyItem(item: FileComparisonItem, summary: inout MergeSummary) throws {
+    func deleteDestinationOnlyItem(item: FileComparisonItem, summary: inout MergeSummary) throws {
         guard let destinationURL = item.destinationURL else { return }
-        guard fileManager.fileExists(atPath: destinationURL.path) else { return }
 
-        try fileManager.removeItem(at: destinationURL)
+        do {
+            try fileManager.removeItem(at: destinationURL)
+        } catch {
+            // 对比后文件可能已被外部删除，或父目录已被递归删除；视为已删除，
+            // 从而省去每个目标独有项一次 fileExists 元数据往返。
+            if Self.isFileNotFoundError(error) {
+                return
+            }
+            throw error
+        }
+
         if item.isDirectory {
             summary.deletedDirectories += 1
         } else {
             summary.deletedFiles += 1
         }
+    }
+
+    /// 是否为“文件已不存在”类错误（外部删除、父目录已递归删除等）。
+    static func isFileNotFoundError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            return Int32(nsError.code) == ENOENT
+        }
+        if nsError.domain == NSCocoaErrorDomain {
+            // 4 = NSFileNoSuchFileError，260 = NSFileReadNoSuchFileError
+            return nsError.code == 4 || nsError.code == 260
+        }
+        return false
     }
 
     private func isHidden(relativePath: String) -> Bool {
@@ -1558,53 +1582,67 @@ final class FileMergeService: @unchecked Sendable {
     /// 故强制走分块路径以提供实时字节进度与速度。
     private static let networkFilesystems: Set<String> = ["smbfs", "nfs", "afpfs", "cifs", "webdav", "osxfuse"]
 
+    /// 小文件复制策略：在数据量与元数据往返之间取最优。
+    enum CopyStrategy: Equatable {
+        /// 远程小文件且目标不存在：直接 copyItem 到最终路径。
+        case directToDestination
+        /// 小文件（本地任意场景、远程覆盖）：copyItem 到临时文件后原子替换。
+        case copyItemToTemp
+        /// 大文件：分块读写，提供实时进度并同步完整属性。
+        case chunked
+    }
+
+    /// 远程小文件的覆盖场景也使用 copyItem：内核 copyfile 一次完成数据与属性，
+    /// 避免逐块写入 + 属性/xattr 的十余次网络往返。小文件无需逐块进度。
+    static func copyStrategy(fileSize: Int64, isRemote: Bool, destinationExists: Bool) -> CopyStrategy {
+        if fileSize <= smallFileThreshold {
+            if isRemote && !destinationExists {
+                return .directToDestination
+            }
+            return .copyItemToTemp
+        }
+        return .chunked
+    }
+
     /// 复制单个文件，保证属性完整与失败时数据安全。
     ///
-    /// - 本地小文件（≤阈值）走 `FileManager.copyItem`：内核 copyfile(2) 单次完成，属性（权限/属主/
-    ///   xattr/时间）随附保留。copyItem 要求目标不存在，故先写临时文件再原子 rename 覆盖。
-    /// - 大文件或远程/网络卷文件走 1MB 分块写入临时文件（提供实时字节进度），写完后补齐
-    ///   POSIX 权限、修改时间、备份标志与扩展属性，最后原子 rename 覆盖目标。
+    /// 策略见 `copyStrategy`：小文件优先走 `FileManager.copyItem`（内核 copyfile，属性随附），
+    /// 大文件走分块写入并补齐属性；目标存在时统一写临时文件后原子替换。
     ///
     /// 任意阶段失败或取消都只清理临时文件，原目标完好无损；rename 在同卷上原子，
     /// 杜绝“原目标已删、新文件没写完”的数据丢失。
-    private func copyFileWithProgress(from sourceURL: URL, to destinationURL: URL, destinationExists: Bool, isCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled }, isRemote: Bool? = nil, onBytesCopied: ((Int64) -> Void)? = nil) throws {
-        let fileSize = (try? sourceURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
+    private func copyFileWithProgress(from sourceURL: URL, to destinationURL: URL, destinationExists: Bool, sourceSize: Int64, isCancelled: @escaping @Sendable () -> Bool = { Task.isCancelled }, isRemote: Bool? = nil, onBytesCopied: ((Int64) -> Void)? = nil) throws {
+        // 大小由扫描/对比阶段直接传入，避免每个文件重复 stat（网络卷上即一次额外 RTT）。
+        let fileSize = sourceSize
 
         // 目标卷是否远程：优先用调用方预算值（整个同步算一次），否则按目标路径 statfs。
         let remote = isRemote ?? isRemoteVolume(destinationURL)
+        let strategy = Self.copyStrategy(fileSize: fileSize, isRemote: remote, destinationExists: destinationExists)
 
-        // 网络卷小文件、目标不存在时，直接 copyItem 到最终目标：内核 copyfile 单次完成、属性随附，
+        // 远程小文件、目标不存在时直接 copyItem 到最终目标：内核 copyfile 单次完成、属性随附，
         // 省去「建 temp + 开关句柄 + 逐块读写 + 属性同步 + xattr 复制 + rename」的十余次网络往返。
-        // 网络卷小文件瓶颈正是这些元数据往返而非数据量——一个 2KB 文件走分块路径要 12+ 次 RTT，
-        // 实测吞吐仅 10~20KB/s；直接 copyItem 一步到位可提升一个数量级以上。
-        // 进度上小文件本就该一次性完成，无需逐块回调。
-        if remote && fileSize <= Self.smallFileThreshold && !destinationExists {
+        if strategy == .directToDestination {
             do {
                 try fileManager.copyItem(at: sourceURL, to: destinationURL)
                 onBytesCopied?(fileSize)
                 return
             } catch {
-                // copyItem 可能在失败前留下部分目标文件。先清理，再走分块路径；
-                // 否则后续 moveItem(temp → destination) 会因目标已存在而永久失败。
+                // copyItem 可能留下部分目标文件；清理后回退到临时文件路径。
                 try? fileManager.removeItem(at: destinationURL)
-                // copyItem 失败（如偶发连接抖动）回退到分块路径，保证健壮性。
             }
         }
 
         // 临时文件与目标同目录（同卷），确保 rename 原子。成功后回收句柄由各路径自行处理。
         let tempURL = makeTempURL(nextTo: destinationURL)
-
-        // 本地小文件走 copyItem（内核 copyfile，属性随附）；大文件或网络卷覆盖场景走分块路径。
-        let useFastPath = fileSize <= Self.smallFileThreshold && !remote
-        var usedFastPath = false
+        var usedCopyItem = false
 
         do {
-            if useFastPath {
-                // 小文件快路径：copyItem 完整保留属性。失败则回退到分块路径统一处理。
+            if strategy == .copyItemToTemp {
+                // 小文件（含远程覆盖）：copyItem 一次完成数据与属性，失败则回退到分块路径。
                 do {
                     try fileManager.copyItem(at: sourceURL, to: tempURL)
                     onBytesCopied?(fileSize)
-                    usedFastPath = true
+                    usedCopyItem = true
                 } catch {
                     try copyLargeFile(from: sourceURL, to: tempURL, fileSize: fileSize, isCancelled: isCancelled, onBytesCopied: onBytesCopied)
                 }
@@ -1612,8 +1650,8 @@ final class FileMergeService: @unchecked Sendable {
                 try copyLargeFile(from: sourceURL, to: tempURL, fileSize: fileSize, isCancelled: isCancelled, onBytesCopied: onBytesCopied)
             }
 
-            // 分块路径需补齐属性（权限/时间/xattr）；快路径 copyItem 已完整保留，跳过以省 I/O。
-            if !usedFastPath {
+            // 分块路径需补齐属性（权限/时间/xattr）；copyItem 路径已完整保留，跳过以省 I/O。
+            if !usedCopyItem {
                 try syncFileAttributes(from: sourceURL, to: tempURL)
             }
 

@@ -9,7 +9,18 @@ struct TestCase {
 @main
 struct MergeServiceTestRunner {
     static func main() async {
-        let filter = CommandLine.arguments.dropFirst().first
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments.first == "--benchmark" {
+            do {
+                try await runBenchmarks(arguments: Array(arguments.dropFirst()))
+            } catch {
+                print("benchmark failed: \(error)")
+                exit(1)
+            }
+            exit(0)
+        }
+
+        let filter = arguments.first
         let all: [TestCase] = [
             TestCase(name: "unreadableSourceSubtreeDoesNotDeleteDestination", run: unreadableSourceSubtreeDoesNotDeleteDestination),
             TestCase(name: "unreadableSourceRootThrowsAndKeepsDestination", run: unreadableSourceRootThrowsAndKeepsDestination),
@@ -32,6 +43,9 @@ struct MergeServiceTestRunner {
             TestCase(name: "remoteVolumeUsesTheItemPath", run: remoteVolumeUsesTheItemPath),
             TestCase(name: "concurrentCopyFailureIsRecordedInSummary", run: concurrentCopyFailureIsRecordedInSummary),
             TestCase(name: "missingDestinationUnderSymlinkIsRejected", run: missingDestinationUnderSymlinkIsRejected),
+            TestCase(name: "copyStrategySelection", run: copyStrategySelection),
+            TestCase(name: "deleteMissingDestinationItemIsNoOp", run: deleteMissingDestinationItemIsNoOp),
+            TestCase(name: "deleteExistingDestinationItem", run: deleteExistingDestinationItem),
         ]
         let selected = filter.map { name in all.filter { $0.name == name } } ?? all
         if selected.isEmpty {
@@ -555,4 +569,65 @@ func missingDestinationUnderSymlinkIsRejected() async throws {
         try expect(error.localizedDescription.contains("父子"),
                    "应抛出父子包含关系错误，实际：\(error.localizedDescription)")
     }
+}
+
+func copyStrategySelection() throws {
+    let small: Int64 = 1024
+    let large: Int64 = 8 * 1024 * 1024
+
+    try expect(FileMergeService.copyStrategy(fileSize: small, isRemote: true, destinationExists: false) == .directToDestination,
+               "远程小文件且目标不存在时应直接 copyItem 到最终路径")
+    try expect(FileMergeService.copyStrategy(fileSize: small, isRemote: true, destinationExists: true) == .copyItemToTemp,
+               "远程小文件覆盖应走 copyItem 到临时文件，跳过逐块写入与属性往返")
+    try expect(FileMergeService.copyStrategy(fileSize: small, isRemote: false, destinationExists: false) == .copyItemToTemp,
+               "本地小文件应走 copyItem 到临时文件后原子替换")
+    try expect(FileMergeService.copyStrategy(fileSize: large, isRemote: true, destinationExists: false) == .chunked,
+               "大文件应走分块路径")
+    try expect(FileMergeService.copyStrategy(fileSize: large, isRemote: false, destinationExists: true) == .chunked,
+               "本地大文件应走分块路径")
+}
+
+func deleteMissingDestinationItemIsNoOp() throws {
+    let root = try makeTempRoot("delete-missing")
+    defer { cleanup(root) }
+    let missing = root.appendingPathComponent("gone.txt")
+    let item = FileComparisonItem(
+        id: "gone.txt",
+        relativePath: "gone.txt",
+        sourceURL: nil,
+        destinationURL: missing,
+        isDirectory: false,
+        sourceSize: nil,
+        destinationSize: 1,
+        sourceMD5: nil,
+        destinationMD5: nil,
+        status: .onlyInDestination,
+        message: nil
+    )
+    var summary = MergeSummary()
+    try FileMergeService().deleteDestinationOnlyItem(item: item, summary: &summary)
+    try expect(summary.deletedFiles == 0, "已经不存在的文件不应计入删除数")
+}
+
+func deleteExistingDestinationItem() throws {
+    let root = try makeTempRoot("delete-existing")
+    defer { cleanup(root) }
+    let file = try makeFile(root, "gone.txt", "x")
+    let item = FileComparisonItem(
+        id: "gone.txt",
+        relativePath: "gone.txt",
+        sourceURL: nil,
+        destinationURL: file,
+        isDirectory: false,
+        sourceSize: nil,
+        destinationSize: 1,
+        sourceMD5: nil,
+        destinationMD5: nil,
+        status: .onlyInDestination,
+        message: nil
+    )
+    var summary = MergeSummary()
+    try FileMergeService().deleteDestinationOnlyItem(item: item, summary: &summary)
+    try expect(summary.deletedFiles == 1, "存在的文件应计入删除数")
+    try expect(!FileManager.default.fileExists(atPath: file.path), "文件应被删除")
 }
